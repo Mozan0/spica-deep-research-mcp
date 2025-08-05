@@ -27,10 +27,15 @@ VECTOR_STORE_ID = os.environ.get("VECTOR_STORE_ID", "")
 openai_client = OpenAI()
 
 server_instructions = """
-This MCP server provides search and document retrieval capabilities 
-for deep research. Use the search tool to find relevant documents 
-based on keywords, then use the fetch tool to retrieve complete 
-document content with citations.
+This MCP server provides advanced search and document retrieval capabilities 
+for deep research using OpenAI Vector Store. Available tools:
+
+1. search: Find relevant documents based on keywords
+2. fetch: Retrieve complete document content with citations  
+3. answer_question: Get AI-powered answers based on your document collection
+
+Use these tools to research topics, find specific information, and get 
+intelligent answers backed by your document sources.
 """
 
 
@@ -38,7 +43,7 @@ def create_server():
     """Create and configure the MCP server with search and fetch tools."""
 
     # Initialize the FastMCP server
-    mcp = FastMCP(name="Sample Deep Research MCP Server",
+    mcp = FastMCP(name="Spica Deep Research MCP Server",
                   instructions=server_instructions)
 
     @mcp.tool()
@@ -179,6 +184,124 @@ def create_server():
             logger.error(f"Error fetching file {id}: {e}")
             raise ValueError(f"Could not fetch document with ID {id}: {str(e)}")
 
+    @mcp.tool()
+    async def answer_question(query: str) -> Dict[str, Any]:
+        """
+        Get an AI-powered answer to your question based on the document collection.
+        
+        This tool searches through your vector store documents, finds the most relevant 
+        content, and uses GPT to provide a comprehensive answer with source citations.
+        
+        Args:
+            query: Your question or research query
+            
+        Returns:
+            Dictionary containing the answer, source information, and metadata
+        """
+        if not query or not query.strip():
+            raise ValueError("Query cannot be empty")
+
+        if not openai_client:
+            logger.error("OpenAI client not initialized - API key missing")
+            raise ValueError("OpenAI API key is required for answering questions")
+
+        logger.info(f"Processing question: {query}")
+
+        try:
+            # Step 1: Search vector store
+            search_response = openai_client.vector_stores.search(
+                vector_store_id=VECTOR_STORE_ID,
+                query=query,
+            )
+
+            if not search_response.data or len(search_response.data) == 0:
+                return {
+                    "query": query,
+                    "answer": "I couldn't find any relevant documents in your collection to answer this question. Try rephrasing your query or ensure your vector store contains relevant content.",
+                    "source_title": "N/A",
+                    "source_url": "N/A",
+                    "success": False
+                }
+
+            # Step 2: Group results by file_id with total score
+            file_score_map = {}
+            file_chunks_map = {}
+
+            for item in search_response.data:
+                file_id = getattr(item, "file_id", None)
+                if not file_id:
+                    continue
+
+                score = getattr(item, "score", 0)  # or similarity
+
+                texts = []
+                if hasattr(item, "content") and isinstance(item.content, list):
+                    for content_obj in item.content:
+                        if hasattr(content_obj, "text"):
+                            texts.append(content_obj.text)
+
+                file_score_map[file_id] = file_score_map.get(file_id, 0) + score
+                file_chunks_map.setdefault(file_id, []).extend(texts)
+
+            if not file_chunks_map:
+                return {
+                    "query": query,
+                    "answer": "No relevant document chunks found for your query. The search returned results but no readable content was available.",
+                    "source_title": "N/A",
+                    "source_url": "N/A",
+                    "success": False
+                }
+
+            # Step 3: Select file with highest total relevance score
+            best_file_id = max(file_score_map, key=file_score_map.get)
+            combined_text = "\n".join(file_chunks_map[best_file_id])
+
+            # Try to get filename from one of the search results for best_file_id
+            filename = None
+            for item in search_response.data:
+                if getattr(item, "file_id", None) == best_file_id:
+                    filename = getattr(item, "filename", None)
+                    break
+
+            # Step 4: Prepare prompt for LLM
+            prompt = f"""Based on the document content below, provide a comprehensive answer to the user's question. Be specific and cite relevant details from the document.
+
+Document Content:
+{combined_text}
+
+User Question: {query}
+
+Please provide a detailed, helpful answer based on the document content. If the document doesn't contain enough information to fully answer the question, mention what information is available and what might be missing."""
+
+            # Step 5: Call OpenAI chat completion
+            response = openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                max_tokens=500  # Increased for more comprehensive answers
+            )
+
+            answer = response.choices[0].message.content.strip()
+
+            return {
+                "query": query,
+                "answer": answer,
+                "source_title": filename or f"Document {best_file_id}",
+                "source_url": f"https://platform.openai.com/storage/files/{best_file_id}",
+                "relevance_score": file_score_map[best_file_id],
+                "success": True
+            }
+
+        except Exception as e:
+            logger.error(f"Error in answer_question: {e}")
+            return {
+                "query": query,
+                "answer": f"An error occurred while processing your question: {str(e)}",
+                "source_title": "N/A",
+                "source_url": "N/A",
+                "success": False
+            }
+
     return mcp
 def main():
     """Main function to start the MCP server."""
@@ -196,128 +319,19 @@ def main():
     # Create the MCP server
     server = create_server()
     
-    # Better approach: define the test function outside and call it directly
-    async def run_answer_test():
-        try:
-            logger.info("Running answer_test on startup...")
-            # result = await answer_test_direct("I want to insert a data into my payment bucket if identity exist go for the flow (use identity login for this) if not write into corrupted bucket and return my corrupted bucket id = corrupted567 fails it should write this into log bucket my log bucket id = log123 my payment id=payment987 give me the functions for this logic use ")  # Call a direct version
-            result = await answer_test_direct("""
-
-        How can insert data in js sdk
-""")
-            logger.info(f"Answer test result: {result}")
-        except Exception as e:
-            logger.error(f"Startup test failed: {e}")
-    
-    # Run the test
-    asyncio.run(run_answer_test())
-    
     # Configure and start the server
-    logger.info("Starting MCP server on 0.0.0.0:8000")
-    logger.info("Server will be accessible via SSE transport")
+    logger.info("Starting MCP server")
+    logger.info("Server will be accessible via stdio transport for Claude Desktop")
+    logger.info("Available tools: search, fetch, answer_question")
 
     try:
-        # Use FastMCP's built-in run method with SSE transport
-        server.run(transport="sse", host="0.0.0.0", port=8000)
+        # Use stdio transport for Claude Desktop integration
+        server.run(transport="stdio")
     except KeyboardInterrupt:
         logger.info("Server stopped by user")
     except Exception as e:
         logger.error(f"Server error: {e}")
         raise
-
-# Add this function outside the server creation
-async def answer_test_direct(query: str) -> Dict[str, Any]:
-    try:
-        logger.info(f"Running dynamic answer_test for: {query}")
-
-        if not openai_client:
-            raise ValueError("OpenAI client is not initialized")
-
-        if not VECTOR_STORE_ID:
-            raise ValueError("VECTOR_STORE_ID is not set")
-
-        # Step 1: Search vector store
-        search_response = openai_client.vector_stores.search(
-            vector_store_id=VECTOR_STORE_ID,
-            query=query,
-        )
-
-        if not search_response.data or len(search_response.data) == 0:
-            raise ValueError("No matching documents found for the query.")
-
-        # Step 2: Group results by file_id with total score
-        file_score_map = {}
-        file_chunks_map = {}
-
-        for item in search_response.data:
-            file_id = getattr(item, "file_id", None)
-            if not file_id:
-                continue
-
-            score = getattr(item, "score", 0)  # or similarity
-
-            texts = []
-            if hasattr(item, "content") and isinstance(item.content, list):
-                for content_obj in item.content:
-                    if hasattr(content_obj, "text"):
-                        texts.append(content_obj.text)
-
-            file_score_map[file_id] = file_score_map.get(file_id, 0) + score
-            file_chunks_map.setdefault(file_id, []).extend(texts)
-
-        if not file_chunks_map:
-            raise ValueError("No document chunks found in search results.")
-
-        # Step 3: Select file with highest total relevance score
-        best_file_id = max(file_score_map, key=file_score_map.get)
-        combined_text = "\n".join(file_chunks_map[best_file_id])
-
-        # Try to get filename from one of the search results for best_file_id
-        filename = None
-        for item in search_response.data:
-            if getattr(item, "file_id", None) == best_file_id:
-                filename = getattr(item, "filename", None)
-                break
-
-        # Step 4: Prepare prompt for LLM
-        prompt = f"""Based on the document below, answer the question:
-Document:
-{combined_text}
-
-Question: {query}
-
-Please provide a short, helpful answer"""
-
-        # Step 5: Call OpenAI chat completion
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            max_tokens=150
-        )
-
-        answer = response.choices[0].message.content.strip()
-
-        return {
-            "query": query,
-            "answer": answer,
-            "source_title": filename or f"Document {best_file_id}",
-            "source_url": f"https://platform.openai.com/storage/files/{best_file_id}",
-            "success": True
-        }
-
-    except Exception as e:
-        logger.error(f"Error in answer_test_direct: {e}")
-        return {
-            "query": query,
-            "answer": f"Error: {str(e)}",
-            "source_title": "N/A",
-            "source_url": "N/A",
-            "success": False
-        }
-
-
-
 
 if __name__ == "__main__":
     main()
